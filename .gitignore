@@ -1,0 +1,75 @@
+# ==============================================================================
+# Swara Project .gitignore
+# ==============================================================================
+
+# Data & Audio Datasets (ignore all files recursively, preserve directory READMEs)
+data/**
+!data/**/
+!data/**/README.md
+*.wav
+*.pcm
+*.raw
+
+# Model binaries & checkpoints (completely untracked)
+models/
+*.tflite
+*.h5
+*.pb
+*.ckpt*
+*.savedmodel/
+
+# Build artifacts & CMake output
+build/
+bin/
+out/
+cmake-build-*/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.ninja
+*.ninja_deps
+*.ninja_log
+
+# Compiled binaries, object files & libraries
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.dylib
+*.dll
+*.exe
+
+# Python artifacts & virtual environments
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.pytest_cache/
+.coverage
+htmlcov/
+*.egg-info/
+.eggs/
+dist/
+venv/
+.venv/
+env/
+ENV/
+
+# IDE & Editor settings
+.vscode/
+.idea/
+*.sublime-project
+*.sublime-workspace
+*.swp
+*.swo
+*~
+
+# Operating System files
+.DS_Store
+Thumbs.db
+desktop.ini
+*.tmp
+*.log
