@@ -70,10 +70,22 @@ swara/
 │   ├── model.py
 │   ├── dataset.py
 │   ├── evaluate.py
-│   └── quantize.py
+│   ├── quantize.py
+│   ├── config.py
+│   ├── validate_tflite.py
+│   ├── export_model_header.py
+│   ├── import_drive_dataset.py
+│   └── prepare_dataset_splits.py
+│
+├── tools/              # Visual inspection & CLI exploration tools
+│   ├── dashboard.py    # Rich interactive terminal dashboard
+│   └── wav_visualizer/ # Windows desktop WAV & MFCC inspection GUI
 │
 ├── data/               # Offline training & validation datasets
-│   ├── raw/
+│   ├── raw/            # Master immutable archive (raw/swara/ + manifest.json)
+│   ├── train/          # Physical training partition (swara: 7 files)
+│   ├── val/            # Physical validation partition (swara: 1 file)
+│   ├── test/           # Physical test partition (swara: 3 files)
 │   ├── processed/
 │   └── augmented/
 │
@@ -105,8 +117,6 @@ The audio front-end and feature extraction parameters are frozen for V0:
 | **Feature Tensor Shape** | `(49, 10, 1)` | 49 time frames × 10 MFCCs × 1 channel (490 floats) |
 
 ---
-
-## 📊 Front-End Performance & Memory Verification (M1b)
 
 ## 📊 Front-End Performance & Memory Verification (M1b)
 
@@ -166,76 +176,122 @@ Or benchmark MFCC feature extraction in isolation:
 
 ---
 
-### 3. Optional Offline Python Tooling (Training & Quantization)
+### 3. Offline Python Tooling (Dataset Ingestion, Training & Quantization)
 
-Install dependencies if training or quantizing new models:
+Install dependencies if developing models or importing audio datasets:
 ```bash
-pip install tensorflow numpy
+pip install tensorflow numpy gdown rich matplotlib
 ```
 
-> [!IMPORTANT]
-> **Status: REAL DATASET NOT YET AVAILABLE.**
-> The real Google Drive dataset has not yet been imported into `data/raw/`.
-> The training and quantization scripts are fully implemented production-ready infrastructure, but will cleanly refuse to run on fake/random/zero data.
-> Speaker metadata is currently unavailable, so all dataset evaluation is strictly **RECORDING-LEVEL** and must never be characterized as speaker-independent.
+#### A. Google Drive Dataset Ingestion Workflow
+Swara provides a deterministic, read-only dataset importer that reads from `.env` and downloads audio without modifying the remote Google Drive folder:
+1. Configure your Google Drive folder link in [`.env`](.env):
+   ```ini
+   GOOGLE_DRIVE_LINK="https://drive.google.com/drive/folders/<your_folder_id>?usp=sharing"
+   ```
+2. Run the automated import pipeline:
+   ```bash
+   py training/import_drive_dataset.py
+   ```
+   * Downloads and validates audio headers using standard library `wave`.
+   * Enforces 16,000 Hz, mono, signed 16-bit PCM.
+   * Performs SHA-256 deduplication and generates [`data/raw/swara/manifest.json`](data/raw/swara/manifest.json).
+   * **Result:** Real recordings are saved in `data/raw/swara/` (currently 11 valid recordings, 33.5s total duration).
 
-#### Expected Dataset Directory Structure
-When real audio recordings become available, place them in `data/raw/` categorized by class:
+#### B. Physical Dataset Partitioning (`train`, `val`, `test`)
+To partition master raw recordings into physical directory splits:
+```bash
+py training/prepare_dataset_splits.py
+```
+This materializes the following layout:
 ```text
-data/raw/
-├── silence/   # Background noise, ambient acoustic environment (.wav)
-├── unknown/   # Non-target speech, background speech, other words (.wav)
-└── swara/     # Target wake phrase recordings ("hello swara" / "swara") (.wav)
+data/
+├── train/
+│   ├── swara/     (7 recordings - 70%)
+│   ├── silence/   (directory ready for negative samples)
+│   └── unknown/   (directory ready for negative samples)
+├── val/
+│   ├── swara/     (1 recording - 15%)
+│   ├── silence/   (ready)
+│   └── unknown/   (ready)
+├── test/
+│   ├── swara/     (3 recordings - 15%)
+│   ├── silence/   (ready)
+│   └── unknown/   (ready)
+└── raw/
+    └── swara/     (11 master recordings + manifest.json)
 ```
 
-#### Pipeline Execution Sequence
-
-1. **Dataset Integrity Audit & Verification**:
-   Inspect all WAV files, calculate class distributions, check audio contract compliance, and detect duplicate files:
+#### C. End-to-End Model Creation Workflow
+1. **Dataset Integrity Audit**:
+   Inspect all WAV files and verify audio specification compliance:
    ```bash
-   python training/inspect_dataset.py --data_dir data/raw
+   py training/inspect_dataset.py --data_dir data
    ```
-2. **Model Training Pipeline**: Train the DS-CNN keyword spotting network once real dataset passes the audit:
+2. **Model Training Pipeline**:
+   Train the DS-CNN keyword spotting network once negative audio samples (`silence`, `unknown`) are placed in `data/train` and `data/val`:
    ```bash
-   python training/train.py --data_dir data/raw --epochs 50 --batch_size 32 --lr 0.001 --save_path models/swara_saved_model
+   py training/train.py --data_dir data --epochs 30 --batch_size 16 --lr 0.001 --save_path models/swara_saved_model
    ```
-3. **Evaluation Pipeline**: Compute recording-level accuracy, confusion matrix, precision, recall, and F1 score across `silence`, `unknown`, and `swara`:
+3. **Recording-Level Evaluation**:
+   Compute accuracy, confusion matrix, precision, and recall on the test set:
    ```bash
-   python training/evaluate.py --model_path models/swara_saved_model --data_dir data/raw --split test
+   py training/evaluate.py --model_path models/swara_saved_model --data_dir data --split test
    ```
-4. **Full Integer INT8 Quantization**: Quantize the trained model using real training audio features for calibration:
+4. **Full Integer INT8 Quantization**:
+   Quantize the trained model using real speech features for calibration:
    ```bash
-   python training/quantize.py --model_path models/swara_saved_model --data_dir data/raw --output_int8 models/swara_int8.tflite
+   py training/quantize.py --model_path models/swara_saved_model --data_dir data --output_int8 models/swara_int8.tflite
    ```
 5. **TFLite Model Inspection & TFLM Operator Validation**:
+   Audit the generated flatbuffer to ensure 100% of operators are supported by TFLM:
    ```bash
-   python training/validate_tflite.py --model_path models/swara_int8.tflite
+   py training/validate_tflite.py --model_path models/swara_int8.tflite
    ```
-6. **Deterministic C Array Export**: Convert verified INT8 TFLite model to 16-byte aligned C deployment arrays:
+6. **Deterministic C Array Export**:
+   Export the model into 16-byte aligned C deployment arrays:
    ```bash
-   python training/export_model_header.py --tflite_path models/swara_int8.tflite --output_cc deployment/model_data.cc --output_h deployment/model_data.h
+   py training/export_model_header.py --tflite_path models/swara_int8.tflite --output_cc deployment/model_data.cc --output_h deployment/model_data.h
    ```
+
+---
+
+### 4. Interactive CLI Dashboard
+Swara includes a rich terminal-based interactive dashboard to explore the entire model creation pipeline, compare DS-CNN architecture candidates against memory budgets, run C benchmarks, verify numerical parity, and audit datasets:
+```bash
+py tools/dashboard.py
+```
+*(Displays ASCII banner, system status box, architecture comparison table, and direct test execution).*
+
+---
+
+### 5. WAV & MFCC Visualizer & Debugger (Desktop GUI)
+A dedicated desktop application (Tkinter + Matplotlib) to inspect audio waveforms, frame boundaries, FFT spectra, Mel filterbanks, and $49 \times 10$ MFCC heatmaps:
+```bash
+py -m tools.wav_visualizer.app.main
+```
+*(Or launch directly from the CLI Dashboard via Option `8`).*
 
 ---
 
 ## 🔍 Verification Status & Confidence Boundaries
 
-To avoid unverified claims, Swara maintains a strict boundary between what is tested/verified and what is pending real data:
+To avoid unverified claims, Swara maintains a strict boundary between what is tested/verified and what is pending full training data:
 
 ### ✅ CURRENTLY VERIFIED
+- **Real Dataset Ingestion:** 11 real "hello swara" recordings successfully imported from Google Drive, SHA-256 deduplicated, and cataloged in `data/raw/swara/manifest.json`.
+- **Physical Dataset Partitioning:** Materialized into `data/train/`, `data/val/`, `data/test/` via deterministic content hashing.
 - **C Audio Front-End:** Circular ring buffer (`audio_buffer.c`), Radix-2 512-point FFT (`fft.c`), and 20 Mel / 10 MFCC extractor (`mfcc.c`) with zero dynamic memory allocation.
 - **DSP Parity:** Numerical equivalence between C and Python feature extraction (Max absolute error $0.0172 < 0.05$).
 - **WAV Ingestion Robustness:** Clean rejection of corrupt headers, non-PCM, stereo, and wrong sample rates.
-- **Dataset Partitioning:** Deterministic recording-level splitting with duplicate content isolation.
 - **TFLM Operator Compatibility:** Verified that DS-CNN compiles to 8 standard operators (`CONV_2D`, `DEPTHWISE_CONV_2D`, `CONV_2D`, `DEPTHWISE_CONV_2D`, `CONV_2D`, `MEAN`, `FULLY_CONNECTED`, `SOFTMAX`), 100% supported by `AllOpsResolver`.
 - **Automated Tests:** 100% pass across all 7 CTest suites and 10 infrastructure unit tests.
 
-### ⏳ NOT YET VERIFIED (Pending Real Data & Hardware)
-- **Model Accuracy & Convergence:** Cannot be measured until real Google Drive audio is imported and trained.
-- **Speaker Generalization:** Speaker identities are not available; cross-speaker robustness cannot be measured.
-- **Final INT8 Calibration:** Quantization scales and zero-points will be determined from real speech calibration data.
-- **Measured Tensor Arena Usage:** Arena footprint (~36.1 KB) is an **ESTIMATE**; runtime measurement via `interpreter.arena_used_bytes()` will be recorded on microcontroller hardware.
-- **Target CPU Latency & Duty Cycle:** Host benchmarks (~0.48 ms/window) demonstrate high throughput, but target MCU (e.g., ARM Cortex-M4/M33) cycle counts require target board profiling.
+### ⏳ PENDING (Awaiting Silence & Unknown Audio Samples)
+- **Model Training & Accuracy:** Training is held until negative class recordings (`silence`, `unknown`) are placed in `data/train` and `data/val` to prevent training on dummy/synthetic audio.
+- **Speaker Generalization:** Speaker identities are not labeled; evaluation is strictly recording-level.
+- **Final INT8 Calibration:** Calibration scales will be calculated from the full 3-class dataset during post-training quantization.
+- **Measured Hardware Arena:** TFLM tensor arena (~36.1 KB) is an **ESTIMATE**; physical runtime measurement via `interpreter.arena_used_bytes()` will be recorded on target microcontroller boards.
 
 ---
 
