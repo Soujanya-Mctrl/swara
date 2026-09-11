@@ -1,27 +1,58 @@
 # ==============================================================================
 # Swara Project .gitignore
+# Ultra-low-power Edge Voice & Wake Detection Runtime
 # ==============================================================================
 
-# Data & Audio Datasets (ignore all files recursively, preserve directory READMEs)
+# ------------------------------------------------------------------------------
+# 1. Audio Data & Test Artifacts
+# ------------------------------------------------------------------------------
+# Ignore raw audio datasets but preserve directory structure
 data/**
 !data/**/
 !data/**/README.md
+!data/**/.gitkeep
+
+# Audio binary formats
 *.wav
 *.pcm
 *.raw
+*.mp3
+*.flac
+*.ogg
 
-# Model binaries & checkpoints (completely untracked)
-models/
+# Ephemeral test artifacts generated during unit test runs
+/test_*.wav
+test_*.wav
+
+# Preserve deterministic test audio fixtures
+!tests/data/
+!tests/data/**
+!tests/data/*.wav
+
+# ------------------------------------------------------------------------------
+# 2. Model Checkpoints & Binaries
+# ------------------------------------------------------------------------------
+# Preserve models directory structure while ignoring large binary weights
+models/**
+!models/**/
+!models/**/README.md
+!models/**/.gitkeep
+
 *.tflite
 *.h5
+*.hdf5
 *.pb
 *.ckpt*
 *.savedmodel/
+*.onnx
 
-# Build artifacts & CMake output
+# ------------------------------------------------------------------------------
+# 3. Build Artifacts & CMake / CTest Output
+# ------------------------------------------------------------------------------
 build/
 bin/
 out/
+dist/
 cmake-build-*/
 CMakeCache.txt
 CMakeFiles/
@@ -30,8 +61,13 @@ Makefile
 *.ninja
 *.ninja_deps
 *.ninja_log
+compile_commands.json
+CTestTestfile.cmake
+Testing/
 
-# Compiled binaries, object files & libraries
+# ------------------------------------------------------------------------------
+# 4. Compiled Binaries, Objects & Libraries
+# ------------------------------------------------------------------------------
 *.o
 *.obj
 *.a
@@ -40,8 +76,16 @@ Makefile
 *.dylib
 *.dll
 *.exe
+*.elf
+*.bin
+*.hex
+*.pdb
+*.idb
+*.ilk
 
-# Python artifacts & virtual environments
+# ------------------------------------------------------------------------------
+# 5. Python Artifacts & Virtual Environments
+# ------------------------------------------------------------------------------
 __pycache__/
 *.py[cod]
 *$py.class
@@ -52,13 +96,14 @@ __pycache__/
 htmlcov/
 *.egg-info/
 .eggs/
-dist/
 venv/
 .venv/
 env/
 ENV/
 
-# IDE & Editor settings
+# ------------------------------------------------------------------------------
+# 6. IDEs, Editors & Operating System Files
+# ------------------------------------------------------------------------------
 .vscode/
 .idea/
 *.sublime-project
@@ -66,8 +111,6 @@ ENV/
 *.swp
 *.swo
 *~
-
-# Operating System files
 .DS_Store
 Thumbs.db
 desktop.ini
