@@ -1,107 +1,139 @@
 """
-Quantization and TFLite conversion pipeline for Swara.
-Converts trained models to:
-1. Float32 TFLite (`models/swara_float32.tflite`)
-2. Fully quantized INT8 TFLite (`models/swaral_int8.tflite` / `models/swara_int8.tflite`)
-And can export C array source/headers for embedded deployment.
+Quantization and TFLite conversion pipeline for Swara (Production-Ready Infrastructure).
+
+Target: FULL INTEGER INT8 TFLite for TensorFlow Lite Micro.
+Requirements:
+- input tensor: INT8 (shape [1, 49, 10, 1])
+- output tensor: INT8 (shape [1, 3])
+- weights & activations: INT8
+- representative dataset MUST come from real training features (never all-zero dummy data)
+- strict failure if real training dataset is absent
 """
 
 import os
+import sys
 import argparse
-import subprocess
+from typing import Generator, List
 import numpy as np
 
+try:
+    import tensorflow as tf
+except ImportError:
+    tf = None
 
-def convert_to_float32_tflite(saved_model_dir: str, output_path: str):
-    """Convert TensorFlow SavedModel to standard Float32 TFLite."""
-    print(f"Converting {saved_model_dir} to Float32 TFLite: {output_path}...")
-    try:
-        import tensorflow as tf
-
-        converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
-        tflite_model = converter.convert()
-        with open(output_path, "wb") as f:
-            f.write(tflite_model)
-        print(f"Float32 model saved to {output_path} ({len(tflite_model)} bytes)")
-    except ImportError:
-        print("TensorFlow not installed. Writing placeholder if missing.")
+from dataset import SwaraDataset
 
 
-def convert_to_int8_tflite(saved_model_dir: str, output_path: str):
-    """Convert TensorFlow SavedModel to full INT8 quantized TFLite with representative dataset."""
-    print(f"Converting {saved_model_dir} to INT8 TFLite: {output_path}...")
-    try:
-        import tensorflow as tf
+def create_representative_dataset_generator(
+    data_dir: str,
+    max_samples: int = 150,
+) -> Generator[List[np.ndarray], None, None]:
+    """
+    Builds a calibration generator yielding real MFCC features from the training dataset split.
+    Fails explicitly if real audio data is absent to avoid invalid zero/dummy calibration.
+    """
+    dataset_loader = SwaraDataset(data_dir=data_dir)
+    splits = dataset_loader.scan_dataset()
+    train_files = splits.get("train", [])
 
-        converter = tf.lite.TFLiteConverter.from_saved_model(saved_model_dir)
-        converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    if len(train_files) == 0:
+        raise FileNotFoundError(
+            f"\n[ERROR] Cannot calibrate INT8 quantization: no real training data found in '{os.path.abspath(data_dir)}'.\n"
+            "Full INT8 quantization requires REAL representative audio features to determine\n"
+            "proper dynamic activation ranges, scale factors, and zero points.\n"
+            "Using fake, random, or zero arrays is strictly prohibited."
+        )
 
-        # Representative dataset generator matching Frozen Audio Spec V0 (49 frames x 10 MFCCs)
-        def representative_data_gen():
-            for _ in range(100):
-                yield [np.zeros((1, 49, 10, 1), dtype=np.float32)]
+    # Use up to max_samples for representative calibration
+    selected_files = train_files[:max_samples]
+    print(f"Calibrating INT8 quantization with {len(selected_files)} real training samples...")
 
-        converter.representative_dataset = representative_data_gen
-        converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
-        converter.inference_input_type = tf.int8
-        converter.inference_output_type = tf.int8
+    X, _ = dataset_loader.load_tensors_from_file_list(selected_files)
 
-        tflite_model = converter.convert()
-        with open(output_path, "wb") as f:
-            f.write(tflite_model)
-        print(f"INT8 model saved to {output_path} ({len(tflite_model)} bytes)")
-    except ImportError:
-        print("TensorFlow not installed. Writing placeholder if missing.")
+    for i in range(len(X)):
+        # Model input shape is (1, 49, 10, 1) float32
+        sample = np.expand_dims(X[i], axis=0).astype(np.float32)
+        yield [sample]
 
 
-def export_c_array(tflite_path: str, output_cc_path: str, output_h_path: str):
-    """Generate C source (.cc) and header (.h) files using xxd or python byte writing."""
-    print(f"Generating C deployment files from {tflite_path}...")
-    if not os.path.exists(tflite_path):
-        print(f"Warning: {tflite_path} not found.")
-        return
+def convert_to_float32_tflite(model_path: str, output_path: str):
+    """Convert Keras model / SavedModel to baseline Float32 TFLite."""
+    if tf is None:
+        raise RuntimeError("TensorFlow is required for TFLite conversion.")
 
-    with open(tflite_path, "rb") as f:
-        data = f.read()
+    print(f"Converting {model_path} to Float32 TFLite: {output_path}...")
+    if os.path.isdir(model_path):
+        converter = tf.lite.TFLiteConverter.from_saved_model(model_path)
+    else:
+        model = tf.keras.models.load_model(model_path)
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
 
-    array_name = "g_swara_model_data"
-    length_name = "g_swara_model_data_len"
+    tflite_model = converter.convert()
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+    print(f"Float32 model saved to {output_path} ({len(tflite_model)} bytes)")
+    return tflite_model
 
-    # Write .h header
-    with open(output_h_path, "w") as h_file:
-        h_file.write(f"""#ifndef SWARA_MODEL_DATA_H_
-#define SWARA_MODEL_DATA_H_
 
-#include <cstdint>
+def convert_to_int8_tflite(
+    model_path: str,
+    data_dir: str,
+    output_path: str,
+    max_calibration_samples: int = 150,
+):
+    """
+    Convert Keras model to FULL INTEGER INT8 TFLite using real dataset calibration.
+    Enforces INT8 input and INT8 output for direct MCU memory mapping.
+    """
+    if tf is None:
+        raise RuntimeError("TensorFlow is required for TFLite quantization.")
 
-extern const unsigned char {array_name}[];
-extern const unsigned int {length_name};
+    print(f"Converting {model_path} to FULL INT8 TFLite: {output_path}...")
+    if not os.path.exists(model_path):
+        raise FileNotFoundError(f"Model file not found at: {model_path}")
 
-#endif  // SWARA_MODEL_DATA_H_
-""")
+    # Enforce representative dataset from real data
+    representative_gen = lambda: create_representative_dataset_generator(
+        data_dir=data_dir,
+        max_samples=max_calibration_samples,
+    )
 
-    # Write .cc source
-    with open(output_cc_path, "w") as cc_file:
-        cc_file.write(f"""#include "model_data.h"
+    if os.path.isdir(model_path):
+        converter = tf.lite.TFLiteConverter.from_saved_model(model_path)
+    else:
+        model = tf.keras.models.load_model(model_path)
+        converter = tf.lite.TFLiteConverter.from_keras_model(model)
 
-// Model bytes generated from {os.path.basename(tflite_path)}
-alignas(16) const unsigned char {array_name}[] = {{
-""")
-        for i, byte in enumerate(data):
-            cc_file.write(f"0x{byte:02x}, ")
-            if (i + 1) % 12 == 0:
-                cc_file.write("\n  ")
-        cc_file.write(f"""\n}};
-const unsigned int {length_name} = {len(data)};
-""")
-    print(f"Generated {output_cc_path} and {output_h_path}")
+    converter.optimizations = [tf.lite.Optimize.DEFAULT]
+    converter.representative_dataset = representative_gen
+    converter.target_spec.supported_ops = [tf.lite.OpsSet.TFLITE_BUILTINS_INT8]
+    converter.inference_input_type = tf.int8
+    converter.inference_output_type = tf.int8
+
+    tflite_model = converter.convert()
+
+    os.makedirs(os.path.dirname(output_path) or ".", exist_ok=True)
+    with open(output_path, "wb") as f:
+        f.write(tflite_model)
+
+    print(f"Full integer INT8 model saved to {output_path} ({len(tflite_model)} bytes)")
+    return tflite_model
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Quantize and Export Swara Model")
-    parser.add_argument("--saved_model", type=str, default="../models/swara_saved_model")
-    parser.add_argument("--output_float32", type=str, default="../models/swara_float32.tflite")
-    parser.add_argument("--output_int8", type=str, default="../models/swaral_int8.tflite")
+    parser = argparse.ArgumentParser(description="Quantize Swara Model to Full Integer INT8")
+    parser.add_argument("--model_path", type=str, required=True, help="Path to trained Keras model or SavedModel")
+    parser.add_argument("--data_dir", type=str, default="data/raw", help="Path to real dataset for INT8 calibration")
+    parser.add_argument("--output_int8", type=str, default="models/swara_int8.tflite", help="Destination path for INT8 TFLite")
+    parser.add_argument("--output_float32", type=str, default="models/swara_float32.tflite", help="Optional Float32 TFLite output")
     args = parser.parse_args()
 
-    print("Quantization utility ready.")
+    if args.output_float32:
+        convert_to_float32_tflite(args.model_path, args.output_float32)
+
+    convert_to_int8_tflite(
+        model_path=args.model_path,
+        data_dir=args.data_dir,
+        output_path=args.output_int8,
+    )

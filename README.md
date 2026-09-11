@@ -158,26 +158,109 @@ Included verification test suites:
 
 Install dependencies if training or quantizing new models:
 ```bash
-pip install tensorflow numpy librosa scipy soundfile
+pip install tensorflow numpy
 ```
 
-1. **Prepare Data**: Place your raw audio samples in `data/raw/`.
-2. **Model Training**: Train the lightweight keyword spotting network:
+> [!IMPORTANT]
+> **Status: REAL DATASET NOT YET AVAILABLE.**
+> The real Google Drive dataset has not yet been imported into `data/raw/`.
+> The training and quantization scripts are fully implemented production-ready infrastructure, but will cleanly refuse to run on fake/random/zero data.
+> Speaker metadata is currently unavailable, so all dataset evaluation is strictly **RECORDING-LEVEL** and must never be characterized as speaker-independent.
+
+#### Expected Dataset Directory Structure
+When real audio recordings become available, place them in `data/raw/` categorized by class:
+```text
+data/raw/
+├── silence/   # Background noise, ambient acoustic environment (.wav)
+├── unknown/   # Non-target speech, background speech, other words (.wav)
+└── swara/     # Target wake phrase recordings ("hello swara" / "swara") (.wav)
+```
+
+#### Pipeline Execution Sequence
+
+1. **Dataset Integrity Audit & Verification**:
+   Inspect all WAV files, calculate class distributions, check audio contract compliance, and detect duplicate files:
    ```bash
-   python training/train.py --epochs 50 --batch_size 32 --lr 0.001
+   python training/inspect_dataset.py --data_dir data/raw
    ```
-3. **Evaluation**: Evaluate performance on test datasets:
+2. **Model Training Pipeline**: Train the DS-CNN keyword spotting network once real dataset passes the audit:
    ```bash
-   python training/evaluate.py --model_path ../models/swara_float32.tflite
+   python training/train.py --data_dir data/raw --epochs 50 --batch_size 32 --lr 0.001 --save_path models/swara_saved_model
    ```
-4. **Quantization & Embedded Export**: Convert the trained model to Float32 & INT8 TFLite, and generate C++ deployment arrays:
+3. **Evaluation Pipeline**: Compute recording-level accuracy, confusion matrix, precision, recall, and F1 score across `silence`, `unknown`, and `swara`:
    ```bash
-   python training/quantize.py
+   python training/evaluate.py --model_path models/swara_saved_model --data_dir data/raw --split test
+   ```
+4. **Full Integer INT8 Quantization**: Quantize the trained model using real training audio features for calibration:
+   ```bash
+   python training/quantize.py --model_path models/swara_saved_model --data_dir data/raw --output_int8 models/swara_int8.tflite
+   ```
+5. **TFLite Model Inspection & TFLM Operator Validation**:
+   ```bash
+   python training/validate_tflite.py --model_path models/swara_int8.tflite
+   ```
+6. **Deterministic C Array Export**: Convert verified INT8 TFLite model to 16-byte aligned C deployment arrays:
+   ```bash
+   python training/export_model_header.py --tflite_path models/swara_int8.tflite --output_cc deployment/model_data.cc --output_h deployment/model_data.h
    ```
 
-Generated C arrays are saved to:
-- `deployment/model_data.h`
-- `deployment/model_data.cc`
+---
+
+## 🔍 Verification Status & Confidence Boundaries
+
+To avoid unverified claims, Swara maintains a strict boundary between what is tested/verified and what is pending real data:
+
+### ✅ CURRENTLY VERIFIED
+- **C Audio Front-End:** Circular ring buffer (`audio_buffer.c`), Radix-2 512-point FFT (`fft.c`), and 20 Mel / 10 MFCC extractor (`mfcc.c`) with zero dynamic memory allocation.
+- **DSP Parity:** Numerical equivalence between C and Python feature extraction (Max absolute error $0.0172 < 0.05$).
+- **WAV Ingestion Robustness:** Clean rejection of corrupt headers, non-PCM, stereo, and wrong sample rates.
+- **Dataset Partitioning:** Deterministic recording-level splitting with duplicate content isolation.
+- **TFLM Operator Compatibility:** Verified that DS-CNN compiles to 8 standard operators (`CONV_2D`, `DEPTHWISE_CONV_2D`, `CONV_2D`, `DEPTHWISE_CONV_2D`, `CONV_2D`, `MEAN`, `FULLY_CONNECTED`, `SOFTMAX`), 100% supported by `AllOpsResolver`.
+- **Automated Tests:** 100% pass across all 7 CTest suites and 10 infrastructure unit tests.
+
+### ⏳ NOT YET VERIFIED (Pending Real Data & Hardware)
+- **Model Accuracy & Convergence:** Cannot be measured until real Google Drive audio is imported and trained.
+- **Speaker Generalization:** Speaker identities are not available; cross-speaker robustness cannot be measured.
+- **Final INT8 Calibration:** Quantization scales and zero-points will be determined from real speech calibration data.
+- **Measured Tensor Arena Usage:** Arena footprint (~36.1 KB) is an **ESTIMATE**; runtime measurement via `interpreter.arena_used_bytes()` will be recorded on microcontroller hardware.
+- **Target CPU Latency & Duty Cycle:** Host benchmarks (~0.48 ms/window) demonstrate high throughput, but target MCU (e.g., ARM Cortex-M4/M33) cycle counts require target board profiling.
+
+---
+
+## 🎯 Model Input / Output Contract
+
+| Property | Value / Specification | Notes |
+| :--- | :--- | :--- |
+| **Input Shape** | `[1, 49, 10, 1]` | 49 time frames × 10 MFCC coefficients × 1 channel |
+| **Input Dtype** | `int8` (post-quantization) | Full integer quantized (-128 to 127) |
+| **Input Scale & Zero Point** | *Calculated at PTQ* | Determined from real representative audio features |
+| **Output Shape** | `[1, 3]` | 3 target classes |
+| **Output Dtype** | `int8` (post-quantization) | Quantized Softmax probabilities |
+| **Class Index 0** | `silence` | Background noise / silence |
+| **Class Index 1** | `unknown` | Non-wake speech / background utterances |
+| **Class Index 2** | `swara` | Target wake phrase |
+
+---
+
+## 💾 System Memory Footprint & 256 KB Budget Breakdown
+
+The architecture is constrained to a total system budget of **$\le 256\text{ KB}$ Total RAM**.
+Memory accounting is categorized into **MEASURED** (front-end C DSP) versus **ESTIMATED** (neural network activations & RTOS):
+
+| Subsystem Component | Memory Type | Allocation | Status | Description |
+| :--- | :--- | :--- | :--- | :--- |
+| **1-sec PCM Audio Buffer** | Static RAM | `32,000 bytes` (31.25 KB) | **MEASURED** | `int16_t[16000]` circular sliding buffer |
+| **MFCC Configuration & Tables** | Static RAM | `26,436 bytes` (25.82 KB) | **MEASURED** | 20 Mel filterbanks, FFT tables, DCT matrix |
+| **49×10 Feature Buffer** | Static RAM | `1,960 bytes` (1.91 KB) | **MEASURED** | 49 frames × 10 MFCCs (`float32[490]`) |
+| **VAD Engine State** | Static RAM | `16 bytes` (0.02 KB) | **MEASURED** | Energy thresholds and hangover state |
+| **Front-End Call Stack Scratch**| Stack Memory| `6,084 bytes` (5.94 KB) | **MEASURED** | FFT scratch buffers & power spectrum |
+| **TFLM Tensor Arena (64-ch)** | Heap / Arena| `~36,960 bytes` (~36.09 KB)| **ESTIMATED** | Activations working arena (estimated) |
+| *(TFLM Arena Alt: 32-ch)* | Heap / Arena| `~20,600 bytes` (~20.12 KB)| **ESTIMATED** | Alternative low-memory candidate |
+| **Firmware Stack & RTOS Overhead**| Stack/BSS  | `~15,360 bytes` (~15.00 KB)| **ESTIMATED** | FreeRTOS task stacks, interrupt stack, BSS |
+| **Application State & Queues** | Static RAM | `~4,096 bytes` (~4.00 KB) | **ESTIMATED** | Classification event flags, IPC queues |
+| **TOTAL SYSTEM RAM (64-ch)** | **Total RAM** | **~122,912 bytes (~120.0 KB)** | **ESTIMATED** | **$\le 256\text{ KB}$ Compliant (~136 KB Headroom)** |
+
+*Model weights (~12.2 KB for INT8 64-channel, or ~4.8 KB for INT8 32-channel) reside in Flash ROM (`alignas(16) const unsigned char g_swara_model_data[]`) and do not consume system RAM.*
 
 ---
 
@@ -186,3 +269,5 @@ Generated C arrays are saved to:
 Detailed technical specifications, component data flows, memory budgets, and change management processes are maintained in [architecture.md](architecture.md).
 
 For regular changes and updates to the architecture, use the `swara-architecture` skill.
+
+

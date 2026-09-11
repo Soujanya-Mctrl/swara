@@ -4,7 +4,10 @@
 #include <cstdint>
 
 // Swara Keyword Spotting / Audio Recognition Model
-// Quantized INT8 model data formatted as C byte array for TensorFlow Lite Micro
+// [INFRASTRUCTURE PLACEHOLDER]
+// NOTE: Real Swara INT8 model has not yet been trained or quantized.
+// The actual model bytes will be generated via training/export_model_header.py
+// once the real Google Drive training dataset is imported and trained.
 extern const unsigned char g_swara_model_data[];
 extern const unsigned int g_swara_model_data_len;
 

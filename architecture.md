@@ -146,24 +146,35 @@ flowchart TD
 | **M0: Scaffold** | Set up repository layout, training modules, model stubs, deployment headers, and architecture tracker | **Completed** | 2026-09-10 | Baseline structure established |
 | **M1a: C Audio Front-End** | Native C `audio_buffer`, `fft` (512 Radix-2), and `mfcc` (20 Mel, 10 DCT) modules with 100% test pass | **Completed** | 2026-09-10 | Zero dynamic allocation, verified with CTest |
 | **M1b: VAD & WAV $\rightarrow$ MFCC** | Energy-based VAD, native WAV parser, pre-emphasis (0.97), Hamming window, full 49x10 feature matrix extractor & benchmarks | **Completed** | 2026-09-10 | Tested on Silence, 1kHz Tone, Speech WAVs. 0.50 ms / 1s audio |
-| **M2: Model Training** | End-to-end model training, loss convergence, checkpoints | Pending | - | Target >95% validation accuracy |
-| **M3: Quantization** | Full INT8 calibration, verify zero accuracy degradation vs Float32 | Pending | - | Calibrate with representative dataset |
-| **M4: Microcontroller Deployment** | TFLite Micro C++ integration, latency & memory profiling on target MCU | Pending | - | Flash < 100KB, RAM < 40KB |
+| **M2b.1: Feature Parity & Contract Audit** | Synchronization of C and Python DSP (pre-emphasis 0.97, Hamming, natural log), numerical parity verification (max err < 0.05), and recording-level split contract | **Completed** | 2026-09-11 | Max abs err: 0.0172, zero leak across splits |
+| **M2c: Drive Dataset Import** | Google Drive dataset importer & audit tool (`import_drive_dataset.py`) for raw WAV ingestion | **Completed** | 2026-09-11 | Verified on test manifests; preserves original files |
+| **M2c.1: Training & TFLM Infrastructure** | Production-ready training loop (`train.py`), recording-level evaluation (`evaluate.py`), strict INT8 quantization (`quantize.py`), TFLite model inspector (`validate_tflite.py`), C-array exporter (`export_model_header.py`) | **Completed** | 2026-09-11 | 100% CTest pass (7/7) & infrastructure test pass (9/9). Zero fake data. |
+| **M2d: Real Model Training** | Train DS-CNN model on real Google Drive dataset once imported | Pending | - | Target high discriminative accuracy (>95%) |
+| **M3: INT8 Quantization** | Full INT8 calibration with real representative dataset, verify accuracy preservation | Pending | - | Export verified `swara_int8.tflite` |
+| **M4: Microcontroller Deployment** | TFLite Micro C++ integration, latency & memory profiling on target MCU | Pending | - | Target RAM $\le 256\text{ KB}$ |
 
 ---
 
-### Verified Memory Consumption Table (Front-End Measured)
+### System Memory Footprint Breakdown ($\le 256\text{ KB}$ Budget)
 
-| Component | Measured RAM | Subsystem Breakdown |
-| :--- | :--- | :--- |
-| **1-sec PCM Audio Buffer** | `32,000 bytes` (31.25 KB) | `int16_t storage[16000]` sliding ring buffer |
-| **Audio Buffer Control Struct** | `16 bytes` | `audio_buffer_t` (capacity, head, count) |
-| **FFT Tables** | `4,996 bytes` (4.88 KB) | Hamming window (1920B) + Twiddle tables (2048B) + Bit-reverse (1024B) |
-| **Mel Filters Table** | `20,640 bytes` (20.16 KB) | 20 triangular filterbank weights & sparse indices |
-| **DCT-II Basis Matrix** | `800 bytes` (0.78 KB) | $10 \times 20$ orthogonal cosine matrix |
-| **VAD Engine State** | `16 bytes` (0.02 KB) | `vad_config_t` thresholds & hangover state |
-| **Peak Runtime Call Stack** | `~5,120 bytes` (~5.00 KB) | Real/imag FFT scratch buffers (4 KB) + power spectrum (1 KB) |
-| **TOTAL FRONT-END RAM** | **`58,472 bytes` (~57.10 KB)** | **Leaves ~198.9 KB for TFLM Tensor Arena, weights, and firmware** |
+| Component / Subsystem | Measured / Estimated | Allocation | Description |
+| :--- | :--- | :--- | :--- |
+| **1-sec PCM Audio Buffer** | **MEASURED** | `32,000 bytes` (31.25 KB) | `int16_t storage[16000]` sliding ring buffer |
+| **Audio Buffer Control Struct** | **MEASURED** | `16 bytes` (0.02 KB) | `audio_buffer_t` (capacity, head, count) |
+| **FFT Tables (twiddle + window)**| **MEASURED** | `4,996 bytes` (4.88 KB) | Hamming window + Twiddle tables + Bit-reverse |
+| **Mel Filters Table** | **MEASURED** | `20,640 bytes` (20.16 KB) | 20 triangular filterbank weights & sparse indices |
+| **DCT-II Basis Matrix** | **MEASURED** | `800 bytes` (0.78 KB) | $10 \times 20$ orthogonal cosine matrix |
+| **49×10 Feature Buffer** | **MEASURED** | `1,960 bytes` (1.91 KB) | 49 frames × 10 MFCCs (`float32[490]`) |
+| **VAD Engine State** | **MEASURED** | `16 bytes` (0.02 KB) | `vad_config_t` thresholds & hangover state |
+| **Front-End Stack Scratch** | **MEASURED** | `6,084 bytes` (5.94 KB) | Real/imag FFT scratch buffers + power spectrum |
+| **TFLM Tensor Arena (64-ch)** | **ESTIMATED** | `~36,960 bytes` (~36.09 KB)| Working activations memory (DS-CNN 64-channel) |
+| *(TFLM Tensor Arena 32-ch Alt)*| **ESTIMATED** | `~20,600 bytes` (~20.12 KB)| Conservative alternative if tighter RAM needed |
+| **Firmware Stack & RTOS Overhead**| **ESTIMATED** | `~15,360 bytes` (~15.00 KB)| FreeRTOS task stacks, interrupt stack, BSS |
+| **Application State & Queues** | **ESTIMATED** | `~4,096 bytes` (~4.00 KB) | Classification event flags, IPC queues |
+| **TOTAL SYSTEM RAM (64-ch)** | **ESTIMATED** | **~122,912 bytes (~120.0 KB)**| **Complies with $\le 256\text{ KB}$ Limit (~136 KB Headroom)** |
+
+*Model weights (~12.2 KB for INT8 64-channel, or ~4.8 KB for INT8 32-channel) reside in Flash ROM (`alignas(16) const unsigned char g_swara_model_data[]`) and do not consume system RAM.*
+
 
 ---
 
@@ -192,9 +203,13 @@ flowchart TD
   3. Idle CPU usage must remain at $\approx 10\%$ through a two-stage pipeline: a lightweight VAD gates the pipeline, keeping MFCC and INT8 DS-CNN inference dormant during silence/noise.
 - **Rationale:** Designing for Python first and porting to C/C++ later leads to bloated tensor arenas and unacceptable idle power drain. Designing around the 256 KB / 10% CPU budget upfront forces deterministic memory layout, static buffer allocation, and aggressive duty cycling.
 
-### ADR-006: Pre-emphasis Filter and Hamming Window Adoption
-- **Decision:** Incorporate pre-emphasis ($y[n] = x[n] - 0.97 \cdot x[n-1]$) and standard Hamming windowing ($w[n] = 0.54 - 0.46 \cos(2\pi n / 479)$) into the front-end DSP pipeline ahead of the 512-point FFT.
-- **Rationale:** Standardizes the acoustic representation with classical speech recognition models, compensates for human vocal tract spectral tilt (6 dB/octave falloff), and matches standard keyword spotting datasets.
+### ADR-007: Strict Verification Boundaries & Benchmark Labeling
+- **Decision:** Explicitly categorize memory and performance metrics into **MEASURED** (front-end C DSP static buffers, WAV parsing, FFT tables) versus **ESTIMATED** (neural network working tensor arena, RTOS overhead). Establish runtime profiling via `interpreter.arena_used_bytes()` as the sole authoritative measurement for TFLM memory once the real INT8 model is deployed.
+- **Rationale:** Prevents premature claims of hardware compliance before models are trained on real acoustic data and tested on physical target microcontrollers.
+
+### ADR-008: Centralized Model Hyperparameters (`config.py`)
+- **Decision:** Centralize model architecture defaults (`DEFAULT_NUM_FILTERS = 64`, `DEFAULT_NUM_CLASSES = 3`, `DEFAULT_INPUT_SHAPE = (49, 10, 1)`) in `training/config.py`, while defining exploration widths (`[16, 24, 32, 48, 64]`) for future candidate benchmarking.
+- **Rationale:** Enables seamless architectural comparisons between 64-channel baseline and lower-RAM candidates (such as 32 channels) across training, evaluation, and export pipelines without scattered manual edits.
 
 ---
 
@@ -213,11 +228,15 @@ When updating the architecture:
 
 | Date | Version | Author | Description of Changes |
 | :--- | :--- | :--- | :--- |
+| 2026-09-11 | v0.5.1 | Antigravity | Hardened dataset ingestion against zero-frame/corrupt audio; implemented content-hash duplicate tracking across recording splits; created training/config.py for centralized channel width management; added ADR-007 and ADR-008; expanded unit tests covering missing classes, corrupt rejection, and flatbuffer header validation. |
+| 2026-09-11 | v0.5.0 | Antigravity | Implemented Milestone M2c.1: Training, Quantization & TFLM Infrastructure. Upgraded dataset loader with clean corrupt WAV rejection; hardened train.py, evaluate.py, and quantize.py to require real data and disallow zero/dummy data; created validate_tflite.py and export_model_header.py; confirmed DS-CNN 8-operator compatibility with TFLM; established comprehensive memory budget distinguishing measured C DSP RAM (60.4 KB) from estimated TFLM arena (~36.1 KB); all 7 C tests and 9 Python infrastructure tests passing. |
 | 2026-09-10 | v0.4.0 | Antigravity | Implemented Milestone M1b: Added energy-based VAD with hangover smoothing, native RIFF WAV parser (16kHz 16-bit mono), pre-emphasis (0.97), Hamming window, and complete 49x10 MFCC window extractor. Verified on silence, pure tone, and speech WAVs with 0.50 ms / 1s audio execution benchmark. Added ADR-006. |
 | 2026-09-10 | v0.3.0 | Antigravity | Implemented native C audio front-end: `audio_buffer` (PCM circular ring buffer), `fft` (512-point Radix-2 Cooley-Tukey with Hanning window), and `mfcc` (20 Mel filters + 10 DCT-II coefficients). Added CMake build system and unit test suites with 100% pass rate. |
 | 2026-09-10 | v0.2.0 | Antigravity | Codified Hard Constraints: C/C++ native runtime only, $\le 256\text{ KB}$ total memory footprint, $\approx 10\%$ idle CPU target via VAD gating (`PCM → VAD → MFCC → DS-CNN → wake detection`), Python relegated to optional offline tooling. Added ADR-005 and updated memory budgets. |
 | 2026-09-10 | v0.1.1 | Antigravity | Froze Audio Specification V0: 16 kHz, 1-ch, signed 16-bit PCM, 1s window (16,000 samples), 30ms frame / 20ms step, 512 FFT, 20 Mel filters, 10 MFCC coefficients, tensor shape `(49, 10, 1)`. Added ADR-004 and updated skills. |
 | 2026-09-10 | v0.1.0 | Antigravity | Initialized project architecture: `data/`, `training/`, `models/`, `deployment/`, `architecture.md`, and `swara-architecture` skill. |
+
+
 
 
 

@@ -1,64 +1,432 @@
 """
-Dataset loader and feature extraction pipeline for Swara.
-Supports audio preprocessing, MFCC / Spectrogram extraction, and data augmentation.
+Swara Dataset Loader, Feature Preprocessing & Inspection Pipeline (Offline Tooling).
+
+This module provides offline dataset utilities for Swara keyword spotting:
+- Ingestion of 16-bit PCM WAV audio
+- Robust format validation and clean rejection of corrupt / non-compliant files
+- Recording-level deterministic train/val/test partitioning (clearly labeled)
+- Detection and avoidance of duplicate recordings across splits
+- Comprehensive dataset inspection & integrity auditing
+- Exact feature extraction matching the active C runtime (src/features/mfcc.c)
 """
 
 import os
-from typing import Tuple, Optional
+import wave
+import struct
+import hashlib
+from typing import Tuple, List, Dict, Optional, Any, Set
 import numpy as np
 
+from config import CLASSES, CLASS_TO_IDX, IDX_TO_CLASS
 
-class SwaraDataset:
-    """Dataset handler for raw, processed, and augmented audio data under Frozen Audio Spec V0."""
+
+def hz_to_mel(hz: float) -> float:
+    return 2595.0 * np.log10(1.0 + (hz / 700.0))
+
+
+def mel_to_hz(mel: float) -> float:
+    return 700.0 * (10.0 ** (mel / 2595.0) - 1.0)
+
+
+class SwaraFeatureExtractor:
+    """
+    Feature extractor synchronized with Swara's active C implementation (mfcc.c, fft.c).
+    NOTE: Pre-emphasis is currently active in C (SWARA_PREEMPHASIS_COEFF = 0.97).
+    """
 
     def __init__(
         self,
-        data_dir: str = "../data",
         sample_rate: int = 16000,
-        channels: int = 1,
-        clip_duration_ms: int = 1000,
-        frame_length_ms: int = 30,
-        frame_step_ms: int = 20,
+        frame_length_samples: int = 480,
+        frame_step_samples: int = 320,
         fft_size: int = 512,
-        n_mels: int = 20,
-        n_mfcc: int = 10,
-        batch_size: int = 32,
+        num_mel_filters: int = 20,
+        num_mfcc_coeffs: int = 10,
+        low_freq_hz: float = 20.0,
+        high_freq_hz: float = 8000.0,
+        preemphasis_coeff: float = 0.97,
+        use_preemphasis: bool = True,
+    ):
+        self.sample_rate = sample_rate
+        self.frame_length = frame_length_samples
+        self.frame_step = frame_step_samples
+        self.fft_size = fft_size
+        self.fft_bins = (fft_size // 2) + 1
+        self.num_mel_filters = num_mel_filters
+        self.num_mfcc = num_mfcc_coeffs
+        self.low_freq_hz = low_freq_hz
+        self.high_freq_hz = high_freq_hz
+        self.preemphasis = preemphasis_coeff
+        self.use_preemphasis = use_preemphasis
+
+        n = np.arange(self.frame_length, dtype=np.float32)
+        self.hamming_window = 0.54 - 0.46 * np.cos(2.0 * np.pi * n / float(self.frame_length - 1))
+        self.mel_filterbank = self._build_mel_filterbank()
+        self.dct_matrix = self._build_dct_matrix()
+
+    def _build_mel_filterbank(self) -> np.ndarray:
+        mel_min = hz_to_mel(self.low_freq_hz)
+        mel_max = hz_to_mel(self.high_freq_hz)
+        mel_step = (mel_max - mel_min) / float(self.num_mel_filters + 1)
+
+        filter_bins = []
+        for i in range(self.num_mel_filters + 2):
+            mel = mel_min + (float(i) * mel_step)
+            hz = mel_to_hz(mel)
+            bin_idx = int(np.floor(hz * float(self.fft_size) / float(self.sample_rate)))
+            bin_idx = max(0, min(bin_idx, self.fft_bins - 1))
+            filter_bins.append(bin_idx)
+
+        weights = np.zeros((self.num_mel_filters, self.fft_bins), dtype=np.float32)
+        for m in range(self.num_mel_filters):
+            left = filter_bins[m]
+            center = filter_bins[m + 1]
+            right = filter_bins[m + 2]
+
+            if center == left:
+                center = left + 1
+            if right <= center:
+                right = center + 1
+            if right >= self.fft_bins:
+                right = self.fft_bins - 1
+
+            for k in range(left, center):
+                weights[m, k] = float(k - left) / float(center - left)
+            for k in range(center, right + 1):
+                weights[m, k] = float(right - k) / float(right - center)
+
+        return weights
+
+    def _build_dct_matrix(self) -> np.ndarray:
+        dct = np.zeros((self.num_mfcc, self.num_mel_filters), dtype=np.float32)
+        for i in range(self.num_mfcc):
+            for m in range(self.num_mel_filters):
+                angle = (np.pi * float(i) * (float(m) + 0.5)) / float(self.num_mel_filters)
+                dct[i, m] = np.cos(angle)
+        return dct
+
+    def extract_frame_mfcc(self, frame_samples: np.ndarray) -> np.ndarray:
+        assert len(frame_samples) == self.frame_length
+
+        if self.use_preemphasis and self.preemphasis > 0.0:
+            pre = np.empty(self.frame_length, dtype=np.int16)
+            pre[0] = frame_samples[0]
+            for i in range(1, self.frame_length):
+                val = float(frame_samples[i]) - (self.preemphasis * float(frame_samples[i - 1]))
+                val = max(-32768.0, min(32767.0, val))
+                pre[i] = int(val)
+        else:
+            pre = frame_samples
+
+        norm_samples = (pre.astype(np.float32) / 32768.0) * self.hamming_window
+        fft_res = np.fft.rfft(norm_samples, n=self.fft_size)
+        power_spectrum = (np.real(fft_res) ** 2 + np.imag(fft_res) ** 2).astype(np.float32)
+
+        mel_energies = np.dot(self.mel_filterbank, power_spectrum)
+        log_energies = np.log(mel_energies + 1e-6)
+
+        mfcc = np.dot(self.dct_matrix, log_energies)
+        return mfcc
+
+    def extract_window_mfcc(self, window_samples: np.ndarray) -> np.ndarray:
+        assert len(window_samples) == 16000
+        features = np.zeros((49, self.num_mfcc), dtype=np.float32)
+
+        for frame_idx in range(49):
+            start = frame_idx * self.frame_step
+            frame = window_samples[start : start + self.frame_length]
+            features[frame_idx] = self.extract_frame_mfcc(frame)
+
+        return features[:, :, np.newaxis]
+
+
+class SwaraDataset:
+    """
+    Dataset loader with deterministic recording-level splitting and strict WAV validation.
+    """
+
+    def __init__(
+        self,
+        data_dir: str = "data/raw",
+        target_sample_rate: int = 16000,
+        target_duration_samples: int = 16000,
+        use_preemphasis: bool = True,
     ):
         self.data_dir = data_dir
-        self.sample_rate = sample_rate
-        self.channels = channels
-        self.clip_duration_ms = clip_duration_ms
-        self.frame_length_ms = frame_length_ms
-        self.frame_step_ms = frame_step_ms
-        self.fft_size = fft_size
-        self.n_mels = n_mels
-        self.n_mfcc = n_mfcc
-        self.batch_size = batch_size
+        self.target_sample_rate = target_sample_rate
+        self.target_duration = target_duration_samples
+        self.feature_extractor = SwaraFeatureExtractor(use_preemphasis=use_preemphasis)
 
-        self.expected_samples = int(self.sample_rate * (self.clip_duration_ms / 1000.0))  # 16,000
-        self.frame_length_samples = int(self.sample_rate * (self.frame_length_ms / 1000.0))  # 480
-        self.frame_step_samples = int(self.sample_rate * (self.frame_step_ms / 1000.0))  # 320
-        self.num_frames = 1 + int((self.expected_samples - self.frame_length_samples) // self.frame_step_samples)  # 49
-
-    def load_audio_file(self, file_path: str) -> np.ndarray:
-        """Load a 16-bit PCM audio file and resample/pad to expected 16,000 samples."""
-        # Placeholder for librosa / torchaudio / scipy.io.wavfile loading
-        # Normalized float32 waveform between -1.0 and 1.0 (from signed 16-bit PCM)
-        return np.zeros(self.expected_samples, dtype=np.float32)
-
-    def extract_features(self, waveform: np.ndarray) -> np.ndarray:
+    def load_wav_file(self, filepath: str) -> np.ndarray:
         """
-        Extract MFCC features for model input.
-        Input: 16,000 samples @ 16kHz
-        Output: shape [49, 10, 1] (time_frames, n_mfcc, channels)
+        Loads and validates a 16kHz mono 16-bit PCM WAV file.
+        Rejects malformed headers, incorrect sample rate, channels, bit-depth, or zero-length cleanly.
         """
-        return np.zeros((self.num_frames, self.n_mfcc, self.channels), dtype=np.float32)
+        try:
+            with wave.open(filepath, "rb") as wf:
+                channels = wf.getnchannels()
+                sample_rate = wf.getframerate()
+                sample_width = wf.getsampwidth()
+                num_frames = wf.getnframes()
 
-    def get_train_val_test_split(self, val_split: float = 0.15, test_split: float = 0.15):
-        """Prepare train, validation, and test datasets."""
-        pass
+                if sample_rate != self.target_sample_rate:
+                    raise ValueError(f"{filepath}: Unsupported sample rate {sample_rate} Hz (expected {self.target_sample_rate} Hz)")
+                if channels != 1:
+                    raise ValueError(f"{filepath}: Unsupported channels {channels} (expected mono)")
+                if sample_width != 2:
+                    raise ValueError(f"{filepath}: Unsupported sample width {sample_width} bytes (expected 16-bit)")
+                if num_frames == 0:
+                    raise ValueError(f"{filepath}: Empty audio file (0 frames)")
+
+                raw_data = wf.readframes(num_frames)
+                samples = np.frombuffer(raw_data, dtype=np.int16)
+        except (wave.Error, EOFError, struct.error) as e:
+            raise ValueError(f"{filepath}: Malformed or corrupt WAV file: {e}")
+
+        # Normalize duration to 1.0 second (16000 samples)
+        if len(samples) < self.target_duration:
+            pad_left = (self.target_duration - len(samples)) // 2
+            pad_right = self.target_duration - len(samples) - pad_left
+            samples = np.pad(samples, (pad_left, pad_right), mode="constant", constant_values=0)
+        elif len(samples) > self.target_duration:
+            start = (len(samples) - self.target_duration) // 2
+            samples = samples[start : start + self.target_duration]
+
+        return samples
+
+    @staticmethod
+    def get_file_content_hash(filepath: str) -> str:
+        """Compute SHA-1 hash of raw file content to identify duplicates."""
+        hasher = hashlib.sha1()
+        with open(filepath, "rb") as f:
+            while chunk := f.read(65536):
+                hasher.update(chunk)
+        return hasher.hexdigest()
+
+    @staticmethod
+    def get_recording_split(file_identifier: str, val_ratio: float = 0.15, test_ratio: float = 0.15) -> str:
+        """
+        DETERMINISTIC RECORDING-LEVEL SPLIT.
+        NOTE: This partition is strictly RECORDING-LEVEL and NOT speaker-independent
+        because speaker identities are not available in the real dataset.
+        Partition is computed deterministically from SHA-1 of filename or content hash.
+        """
+        norm_id = os.path.basename(file_identifier).strip().lower()
+        hash_val = int(hashlib.sha1(norm_id.encode("utf-8")).hexdigest(), 16) % 100
+        val_threshold = int(val_ratio * 100)
+        test_threshold = val_threshold + int(test_ratio * 100)
+
+        if hash_val < val_threshold:
+            return "val"
+        elif hash_val < test_threshold:
+            return "test"
+        else:
+            return "train"
+
+    def scan_dataset(self, deduplicate_by_content: bool = True) -> Dict[str, List[Tuple[str, int, Optional[str]]]]:
+        """
+        Scan data_dir for class subdirectories and assign each file deterministically
+        via recording-level splitting.
+        If deduplicate_by_content is True, identical duplicate recordings are identified
+        by content hash and kept in the same split or ignored to prevent data leakage.
+        """
+        splits: Dict[str, List[Tuple[str, int, Optional[str]]]] = {"train": [], "val": [], "test": []}
+        seen_content_hashes: Dict[str, str] = {}  # hash -> split_name
+
+        for class_name, class_idx in CLASS_TO_IDX.items():
+            class_dir = os.path.join(self.data_dir, class_name)
+            if not os.path.exists(class_dir):
+                raw_dir = os.path.join(self.data_dir, "raw", class_name)
+                if os.path.exists(raw_dir):
+                    class_dir = raw_dir
+                else:
+                    continue
+
+            for root, _, files in os.walk(class_dir):
+                for f in sorted(files):
+                    if f.lower().endswith(".wav"):
+                        path = os.path.join(root, f)
+
+                        if deduplicate_by_content:
+                            try:
+                                c_hash = self.get_file_content_hash(path)
+                                if c_hash in seen_content_hashes:
+                                    # Duplicate found! Assign to SAME split as original to prevent train/val leakage
+                                    target_split = seen_content_hashes[c_hash]
+                                    splits[target_split].append((path, class_idx, None))
+                                    continue
+                                else:
+                                    target_split = self.get_recording_split(f)
+                                    seen_content_hashes[c_hash] = target_split
+                                    splits[target_split].append((path, class_idx, None))
+                            except Exception:
+                                target_split = self.get_recording_split(f)
+                                splits[target_split].append((path, class_idx, None))
+                        else:
+                            split = self.get_recording_split(f)
+                            splits[split].append((path, class_idx, None))
+
+        return splits
+
+    def count_total_files(self, splits: Dict[str, List[Tuple[str, int, Optional[str]]]]) -> int:
+        return sum(len(entries) for entries in splits.values())
+
+    def get_classes_present(self, splits: Dict[str, List[Tuple[str, int, Optional[str]]]]) -> Set[int]:
+        classes = set()
+        for entries in splits.values():
+            for _, class_idx, _ in entries:
+                classes.add(class_idx)
+        return classes
+
+    def load_tensors_from_file_list(
+        self,
+        file_entries: List[Tuple[str, int, Optional[str]]],
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        num_samples = len(file_entries)
+        if num_samples == 0:
+            return (
+                np.zeros((0, 49, 10, 1), dtype=np.float32),
+                np.zeros((0,), dtype=np.int32),
+            )
+
+        valid_X = []
+        valid_y = []
+
+        for fpath, class_idx, _ in file_entries:
+            try:
+                audio = self.load_wav_file(fpath)
+                features = self.feature_extractor.extract_window_mfcc(audio)
+                valid_X.append(features)
+                valid_y.append(class_idx)
+            except ValueError as e:
+                print(f"[Warning] Skipping invalid/corrupt audio file {fpath}: {e}")
+
+        if len(valid_X) == 0:
+            return (
+                np.zeros((0, 49, 10, 1), dtype=np.float32),
+                np.zeros((0,), dtype=np.int32),
+            )
+
+        X = np.stack(valid_X, axis=0).astype(np.float32)
+        y = np.array(valid_y, dtype=np.int32)
+        return X, y
 
 
-if __name__ == "__main__":
-    dataset = SwaraDataset()
-    print(f"SwaraDataset initialized with sample rate: {dataset.sample_rate} Hz")
+def inspect_dataset(data_dir: str) -> Dict[str, Any]:
+    """
+    Comprehensive dataset inspection and validation audit.
+    Inspects all WAV files under data_dir and reports class distributions, durations,
+    sample rates, channel formats, and potential duplicates.
+    """
+    report: Dict[str, Any] = {
+        "target_directory": os.path.abspath(data_dir),
+        "total_wav_files": 0,
+        "valid_wav_files": 0,
+        "invalid_corrupt_files": [],
+        "sample_rates": {},
+        "channel_counts": {},
+        "bit_depths": {},
+        "durations_sec": [],
+        "files_shorter_than_1s": 0,
+        "files_longer_than_1s": 0,
+        "files_exact_1s": 0,
+        "duplicate_files_count": 0,
+        "duplicate_groups": [],
+        "filename_patterns": set(),
+        "class_breakdown": {cls: {"total": 0, "valid": 0, "duration_sec": 0.0} for cls in CLASSES},
+        "class_imbalance_ratio": 1.0,
+        "usable_recordings": 0,
+    }
+
+    if not os.path.exists(data_dir):
+        report["error"] = f"Directory not found: {data_dir}"
+        return report
+
+    all_wavs = []
+    for root, _, files in os.walk(data_dir):
+        for f in sorted(files):
+            if f.lower().endswith(".wav"):
+                all_wavs.append(os.path.join(root, f))
+
+    report["total_wav_files"] = len(all_wavs)
+    if len(all_wavs) == 0:
+        report["error"] = f"No .wav files found under: {os.path.abspath(data_dir)}"
+        return report
+
+    content_hashes: Dict[str, List[str]] = {}
+
+    for wav_path in all_wavs:
+        # Determine class if within class folder
+        path_lower = wav_path.lower().replace("\\", "/")
+        assigned_class = None
+        for c in CLASSES:
+            if f"/{c}/" in path_lower or path_lower.endswith(f"/{c}"):
+                assigned_class = c
+                break
+
+        if assigned_class:
+            report["class_breakdown"][assigned_class]["total"] += 1
+
+        basename = os.path.basename(wav_path)
+        pattern = "numeric" if any(c.isdigit() for c in basename) else "alpha"
+        if "_" in basename:
+            pattern += f"_underscore_{len(basename.split('_'))-1}"
+        report["filename_patterns"].add(pattern)
+
+        try:
+            with open(wav_path, "rb") as raw_f:
+                file_bytes = raw_f.read()
+                file_md5 = hashlib.md5(file_bytes).hexdigest()
+                content_hashes.setdefault(file_md5, []).append(wav_path)
+
+            with wave.open(wav_path, "rb") as wf:
+                channels = wf.getnchannels()
+                sample_rate = wf.getframerate()
+                sample_width = wf.getsampwidth()
+                num_frames = wf.getnframes()
+                bit_depth = sample_width * 8
+
+                if num_frames == 0:
+                    raise ValueError("Audio file contains 0 frames")
+
+                report["valid_wav_files"] += 1
+                report["sample_rates"][sample_rate] = report["sample_rates"].get(sample_rate, 0) + 1
+                report["channel_counts"][channels] = report["channel_counts"].get(channels, 0) + 1
+                report["bit_depths"][bit_depth] = report["bit_depths"].get(bit_depth, 0) + 1
+
+                duration_sec = float(num_frames) / float(sample_rate) if sample_rate > 0 else 0.0
+                report["durations_sec"].append(duration_sec)
+
+                if assigned_class:
+                    report["class_breakdown"][assigned_class]["valid"] += 1
+                    report["class_breakdown"][assigned_class]["duration_sec"] += duration_sec
+
+                if num_frames < sample_rate:
+                    report["files_shorter_than_1s"] += 1
+                elif num_frames > sample_rate:
+                    report["files_longer_than_1s"] += 1
+                else:
+                    report["files_exact_1s"] += 1
+
+                # Check if fully usable per Swara Audio Contract (16kHz, mono, 16-bit)
+                if sample_rate == 16000 and channels == 1 and bit_depth == 16:
+                    report["usable_recordings"] += 1
+
+        except Exception as e:
+            report["invalid_corrupt_files"].append({"file": wav_path, "error": str(e)})
+
+    # Detect duplicates
+    for md5, paths in content_hashes.items():
+        if len(paths) > 1:
+            report["duplicate_files_count"] += len(paths) - 1
+            report["duplicate_groups"].append({"md5": md5, "copies": paths})
+
+    # Class imbalance calculation
+    counts = [info["valid"] for info in report["class_breakdown"].values() if info["valid"] > 0]
+    if len(counts) > 1:
+        report["class_imbalance_ratio"] = float(max(counts)) / float(min(counts))
+    else:
+        report["class_imbalance_ratio"] = 1.0
+
+    report["filename_patterns"] = sorted(list(report["filename_patterns"]))
+    return report

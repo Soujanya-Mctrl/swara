@@ -71,7 +71,9 @@ $$\text{PCM} \longrightarrow \text{VAD} \longrightarrow \text{MFCC} \longrightar
 
 When writing or modifying code in Swara:
 
-- [ ] `training/dataset.py`: Ensure `sample_rate=16000`, `clip_duration_ms=1000`, `n_mfcc=10`, `n_mels=20`, `n_fft=512`, `win_length=480`, `hop_length=320`.
-- [ ] `training/model.py`: Ensure model `input_shape` default is `(49, 10, 1)`.
-- [ ] `training/quantize.py`: Ensure calibration generator inputs match shape `(1, 49, 10, 1)`.
+- [ ] `training/dataset.py`: Ensure `sample_rate=16000`, `clip_duration_ms=1000`, `n_mfcc=10`, `n_mels=20`, `n_fft=512`, `win_length=480`, `hop_length=320`, pre-emphasis=0.97.
+- [ ] `training/model.py`: Ensure model `input_shape` default is `(49, 10, 1)`, classes=3 (`0: silence`, `1: unknown`, `2: swara`), filters=64.
+- [ ] `training/quantize.py`: Ensure calibration generator inputs match shape `(1, 49, 10, 1)` and use REAL data, with full INT8 input and output.
+- [ ] Model contract: Input `[1, 49, 10, 1]` INT8, output `[1, 3]` INT8.
 - [ ] Microcontroller DSP code / C++ drivers: Verify I2S or PDM microphone is configured for 16 kHz, 16-bit Mono, and ring buffer feeds frames of 480 samples every 320 samples.
+

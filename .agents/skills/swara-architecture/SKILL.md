@@ -41,27 +41,46 @@ Every change to Swara must satisfy these hard constraints:
 
 ```text
 D:\Projects\swara\
-├── deployment\         # Core C/C++ runtime and deployment artifacts (PRIMARY RUNTIME)
-│   ├── model_data.cc   # C++ byte array definition for TFLite Micro runtime
-│   └── model_data.h    # C++ header declaring external model array & length
+├── src\                # PRIMARY RUNTIME: Native C embedded implementation
+│   ├── audio\          # audio_buffer.c/h, vad.c/h, wav_reader.c/h
+│   ├── features\       # fft.c/h (512-pt Radix-2), mfcc.c/h (20 Mel, 10 DCT)
+│   └── model\          # classifier.c/h (TFLM runtime wrapper)
+├── deployment\         # Core C/C++ runtime and deployment artifacts
+│   ├── model_data.cc   # 16-byte aligned C++ byte array definition for TFLite Micro
+│   ├── model_data.h    # C++ header declaring external model array & length
+│   └── README.md       # TFLM deployment pipeline, model contract & memory budget
 ├── models\             # Frozen model binaries
 │   ├── swara_float32.tflite  # Baseline Float32 model
-│   └── swaral_int8.tflite    # Fully quantized INT8 model for microcontrollers
+│   └── swara_int8.tflite     # Fully quantized INT8 model for microcontrollers
 ├── training\           # OPTIONAL external tooling (Python offline development)
+│   ├── config.py       # Centralized hyperparameters (channel count, classes, shapes)
 │   ├── train.py        # Model training loop, callbacks, saved model export
-│   ├── model.py        # Neural network architecture (DS-CNN, Edge Conv)
-│   ├── dataset.py      # Audio loading, feature extraction & generator pipelines
-│   ├── evaluate.py     # Evaluation metrics (accuracy, F1, latency, confusion matrix)
-│   └── quantize.py     # TFLite conversion (Float32 & full INT8) + C array generator
+│   ├── model.py        # DS-CNN (64 filters, 3 classes: silence, unknown, swara)
+│   ├── dataset.py      # Audio loading, feature extraction & deterministic splits
+│   ├── evaluate.py     # Recording-level evaluation (accuracy, F1, confusion matrix)
+│   ├── quantize.py     # Full INT8 quantization with real representative dataset
+
+│   ├── validate_tflite.py # TFLite model inspector & TFLM operator validator
+│   ├── export_model_header.py # Deterministic TFLite to C array exporter
+│   ├── inspect_dataset.py     # Standalone dataset audit & integrity analyzer
+│   └── import_drive_dataset.py # Google Drive WAV import & sync utility
+├── tests\              # Native C and Python verification test suites
+│   ├── data\           # Test fixtures (test_16k_1s.wav, test_dataset_fixture/)
+│   ├── test_audio_buffer.c, test_vad.c, test_wav.c, test_fft.c, test_mfcc.c
+│   ├── test_pipeline.c, test_wav_mfcc.c, benchmark_mfcc.c
+│   ├── test_feature_parity.py # Numerical C vs Python MFCC verification
+│   └── test_training_infrastructure.py # Infrastructure unit tests
 ├── data\               # Offline training & validation datasets
-│   ├── raw\            # Original audio recordings (.wav)
+│   ├── raw\            # Original audio recordings (.wav) by class (silence, unknown, swara)
 │   ├── processed\      # Extracted spectrograms, MFCC features
 │   └── augmented\      # Synthetic/augmented data (noise injection, time shift, pitch)
+├── CMakeLists.txt      # Root build configuration for runtime & test suites
 ├── architecture.md     # Primary architecture specification & change log
 └── README.md           # Project overview and developer guide
 ```
 
 ---
+
 
 ## 4. Regular Change Workflow
 

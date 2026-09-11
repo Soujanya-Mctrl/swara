@@ -1,7 +1,9 @@
 #include "model_data.h"
 
-// Model bytes array for TensorFlow Lite Micro
-// Generated via training/quantize.py from INT8 TFLite model
+// [INFRASTRUCTURE PLACEHOLDER]
+// Minimal placeholder byte sequence for link testing before real model training.
+// DO NOT treat this as a functional Swara wake word model.
+// Real model data will be exported via training/export_model_header.py.
 alignas(16) const unsigned char g_swara_model_data[] = {
     0x18, 0x00, 0x00, 0x00, 0x54, 0x46, 0x4c, 0x33, 0x00, 0x00, 0x0e, 0x00,
     0x18, 0x00, 0x04, 0x00, 0x08, 0x00, 0x0c, 0x00, 0x10, 0x00, 0x14, 0x00,

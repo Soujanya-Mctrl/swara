@@ -4,13 +4,15 @@ Designed for low-latency, low-memory edge deployments (TFLite / Microcontrollers
 """
 
 from typing import Tuple
+from config import DEFAULT_INPUT_SHAPE, DEFAULT_NUM_CLASSES, DEFAULT_NUM_FILTERS
 
 
 def build_dscnn_model(
-    input_shape: Tuple[int, int, int] = (49, 10, 1),
-    num_classes: int = 4,
-    num_filters: int = 64,
+    input_shape: Tuple[int, int, int] = DEFAULT_INPUT_SHAPE,
+    num_classes: int = DEFAULT_NUM_CLASSES,
+    num_filters: int = DEFAULT_NUM_FILTERS,
 ):
+
     """
     Build a Depthwise Separable Convolutional Neural Network (DS-CNN).
     Optimized for Swara Frozen Audio Spec V0 (49 frames x 10 MFCCs).
