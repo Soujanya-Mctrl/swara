@@ -108,15 +108,20 @@ The audio front-end and feature extraction parameters are frozen for V0:
 
 ## 📊 Front-End Performance & Memory Verification (M1b)
 
-Measured via [`benchmark_mfcc`](tests/benchmark_mfcc.c) on host machine:
+## 📊 Front-End Performance & Memory Verification (M1b)
+
+Measured via [`benchmark_pipeline`](tests/benchmark_pipeline.c) on host machine:
 
 | Metric | Measured Benchmark | Notes |
 | :--- | :--- | :--- |
-| **Single Frame (480 samples / 30 ms)** | **`9.67 µs`** (0.0097 ms) | **3,102× faster than real-time** |
-| **1-Second Window (49 frames)** | **`0.483 ms`** | **2,071× faster than real-time** |
-| **Throughput (Frames/sec)** | **`103,424 frames / sec`** | Massive real-time headroom |
-| **Host CPU Duty Cycle (Active)** | **`0.048%`** | Ultra-low power profile |
-| **Total Front-End Static RAM** | **`60,400 bytes`** (~58.98 KB) | Buffer + Mel tables + FFT + 49x10 matrix |
+| **VAD Gating Check (20 ms frame)** | **`0.15 µs`** (0.00015 ms) | **6.62M frames / sec** |
+| **VAD Idle CPU Duty Cycle** | **`0.0008%`** | Far below the hard $\approx 10\%$ CPU idle budget |
+| **Buffer Ingestion (320-sample hop)** | **`2.54 µs`** | Real-time sliding window write |
+| **Single Frame MFCC (30 ms / 480 spl)** | **`10.03 µs`** (0.010 ms) | **2,991× faster than real-time** |
+| **1-Second Active Window (49 frames)** | **`0.458 ms`** | **2,183× faster than real-time (RTF 1:2183)** |
+| **Active Speech CPU Duty Cycle** | **`0.046%`** | Ultra-low power profile |
+| **Streaming Pipeline (50% speech / 50% silence)** | **`0.613 ms` / 1s audio** | 4,900 silence frames bypassed via VAD |
+| **Total Front-End Static RAM** | **`60,444 bytes`** (~59.03 KB) | Ring buffer + VAD + Mel + FFT + 49x10 matrix |
 | **Peak Stack Scratch Memory** | **`6,084 bytes`** (~5.94 KB) | 512-pt complex FFT + power spectrum |
 | **Dynamic Allocations (`malloc`)** | **`0 bytes`** | Zero dynamic heap allocation |
 
@@ -146,11 +151,18 @@ Included verification test suites:
 - `test_pipeline`: End-to-end synthetic silence, tone, and vowel formant speech audio pipelines.
 - `test_wav_mfcc`: End-to-end WAV file ingestion to 49×10 MFCC matrix with canary boundary guard checks.
 
-### 2. Run the Performance Benchmark
+### 2. Run the Performance Benchmarks
 
+Run the complete end-to-end audio pipeline benchmark:
+```bash
+./build/benchmark_pipeline
+```
+
+Or benchmark MFCC feature extraction in isolation:
 ```bash
 ./build/benchmark_mfcc
 ```
+
 
 ---
 

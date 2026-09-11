@@ -82,3 +82,10 @@ target_link_libraries(benchmark_mfcc swara_core)
 if(NOT MSVC)
     target_link_libraries(benchmark_mfcc m)
 endif()
+
+add_executable(benchmark_pipeline tests/benchmark_pipeline.c)
+target_link_libraries(benchmark_pipeline swara_core)
+if(NOT MSVC)
+    target_link_libraries(benchmark_pipeline m)
+endif()
+
